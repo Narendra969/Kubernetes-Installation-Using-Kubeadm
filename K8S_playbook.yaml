@@ -1,5 +1,240 @@
-- hosts: Kubernetes_Master
-  becom: yes
+---
+- hosts: Master
+  become: true
+  tasks:
+    - name: Set Host Name for Master
+      command: hostnamectl set-hostname K8S_Master
+
+- hosts: Workers
+  become: true
+  tasks:
+    - name: Set Host Name for Worker1
+      command: hostnamectl set-hostname K8S_Worker1
+      when: inventory_hostname == 'Worker1'
+
+- hosts: Workers
+  become: true
+  tasks:
+    - name: Set Host Name for Worker2
+      command: hostnamectl set-hostname K8S_Worker2
+      when: inventory_hostname == 'Worker2'
+
+- hosts: all
+  become: true
+  tasks:
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Comment out swap entry in /etc/fstab
+      command: sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Install required packages
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - unzip
+        - bzip2
+        - xz-utils
+        - tar
+        - wget
+
+    - name: Download containerd tarball
+      shell: wget https://github.com/containerd/containerd/releases/download/v1.7.2/containerd-1.7.2-linux-amd64.tar.gz
+
+    - name: Extract containerd tarball
+      shell: tar Cxzvf /usr/local containerd-1.7.2-linux-amd64.tar.gz
+
+    - name: Download containerd service file
+      shell: wget https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+
+    - name: Create directory for containerd service file
+      file:
+        path: /usr/local/lib/systemd/system
+        state: directory
+
+    - name: Move containerd service file
+      shell: mv containerd.service /usr/local/lib/systemd/system/containerd.service
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start containerd service
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    - name: Download runc binary
+      shell: wget https://github.com/opencontainers/runc/releases/download/v1.1.7/runc.amd64
+
+    - name: Install runc binary
+      shell: install -m 755 runc.amd64 /usr/local/sbin/runc
+
+    - name: Download CNI plugins tarball
+      shell: wget https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz
+
+    - name: Create directory for CNI plugins
+      file:
+        path: /opt/cni/bin
+        state: directory
+
+    - name: Extract CNI plugins tarball
+      shell: tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-v1.3.0.tgz
+
+    - name: Download crictl binary
+      shell: wget https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.27.0/crictl-v1.27.0-linux-amd64.tar.gz
+
+    - name: Extract crictl binary
+      shell: sudo tar zxvf crictl-v1.27.0-linux-amd64.tar.gz -C /usr/local/bin
+
+    - name: Remove crictl tarball
+      file:
+        path: crictl-v1.27.0-linux-amd64.tar.gz
+        state: absent
+
+    - name: Create crictl configuration file
+      copy:
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 2
+          debug: false
+          pull-image-on-create: false
+        dest: /etc/crictl.yaml
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Configure kernel modules for Kubernetes
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Load kernel modules
+      command: modprobe {{ item }}
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configure sysctl settings for Kubernetes
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+        dest: /etc/sysctl.d/k8s.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Apply sysctl settings
+      command: sysctl --system
+
+    - name: Verify sysctl settings
+      command: sysctl {{ item }}
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    - name: Load br_netfilter module
+      command: modprobe br_netfilter
+
+    - name: Apply sysctl settings from /etc/sysctl.conf
+      command: sysctl -p /etc/sysctl.conf
+
+    - name: Update apt cache and install dependencies
+      apt:
+        name: apt-transport-https,curl
+        state: present
+        update_cache: yes
+
+    - name: Add Kubernetes apt repository key
+      shell: curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+
+    - name: Add Kubernetes apt repository
+      copy:
+        content: |
+          deb https://apt.kubernetes.io/ kubernetes-xenial main
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+- hosts: Master
+  become: true
+  tasks:
+    - name: Install Kubernetes packages
+      apt:
+        name: kubelet,kubeadm,kubectl
+        state: present
+
+    - name: Mark Kubernetes packages on hold
+      shell: apt-mark hold "{{ item }}"
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Pull Kubernetes container images
+      command: kubeadm config images pull
+      changed_when: false
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --ignore-preflight-errors=Port-6443,Port-10259,Port-10257,FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml,FileAvailable--etc-kubernetes-manifests-kube-controller-manager.yaml,FileAvailable--etc-kubernetes-manifests-kube-scheduler.yaml,FileAvailable--etc-kubernetes-manifests-etcd.yaml,Port-10250,Port-2379,Port-2380,DirAvailable--var-lib-etcd
+      changed_when: false
+
+    - name: Create .kube directory
+      file:
+        path: "/home/ubuntu/.kube"
+        state: directory
+        owner: "ubuntu"
+        group: "ubuntu"
+        mode: '0700'
+
+    - name: Copy admin.conf to user's home directory
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/ubuntu/.kube/config"
+        remote_src: true
+        owner: "ubuntu"
+        group: "ubuntu"
+        mode: '0600'
+
+    - name: Install Pod Network
+      become_user: ubuntu
+      shell: kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml >> pod_setup.txt
+      args:
+        chdir: $HOME
+        creates: pod_setup.txt
+
+- hosts: Workers
+  become: true
+  tasks:
+    - name: Install Kubernetes packages
+      apt:
+        name: kubelet,kubeadm
+        state: present
+
+    - name: Mark Kubernetes packages on hold
+      shell: apt-mark hold "{{ item }}"
+      loop:
+        - kubelet
+        - kubeadm
+
+- hosts: Master
+  become: yes
   gather_facts: false
   tasks:
    - name: get join command
@@ -11,14 +246,15 @@
        name: "DUMMY_HOST"
        JOIN_COMMAND: "{{join_command_raw.stdout}}"
 
-- hosts: Kubernetes_Worker
-  becom: yes
+- hosts: Workers
+  become: yes
   tasks:
   - name: join cluster
     shell: "{{ hostvars['DUMMY_HOST'] ['JOIN_COMMAND'] }} >> node.join.txt"
     args:
       chdir: $HOME
       creates: node.join.txt
+...
 
   
    
